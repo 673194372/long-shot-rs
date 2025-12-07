@@ -1,0 +1,160 @@
+//! Long Shot - Native Wayland Scrolling Screenshot Tool
+//!
+//! A high-performance long screenshot (scrolling capture) application for Linux Wayland.
+//!
+//! Architecture:
+//! - Thread A (Input Monitor): Watches /dev/input for scroll wheel events via evdev
+//! - Thread B (Worker): Handles Wayland screencopy and OpenCV image stitching
+//! - Thread C (GUI): Layer-shell overlay for always-on-top preview
+
+mod capture;
+mod gui;
+mod input;
+mod overlay;
+mod selector;
+mod stitch;
+mod types;
+mod worker;
+
+use anyhow::Result;
+use log::{error, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use capture::select_region_with_slurp;
+use input::start_input_thread;
+use overlay::run_overlay;
+use types::Channels;
+use worker::start_worker_thread;
+
+fn main() -> Result<()> {
+    // Initialize logging
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
+    info!("Long Shot - Wayland Scrolling Screenshot");
+    info!("=========================================");
+
+    // Check for Wayland session
+    if std::env::var("WAYLAND_DISPLAY").is_err() {
+        error!("No Wayland display found. This application requires a Wayland session.");
+        eprintln!(
+            "\n╔══════════════════════════════════════════════════════════════╗"
+        );
+        eprintln!(
+            "║  ERROR: Wayland display not found.                          ║"
+        );
+        eprintln!(
+            "║                                                              ║"
+        );
+        eprintln!(
+            "║  This application requires a Wayland session.               ║"
+        );
+        eprintln!(
+            "║  Please run from a Wayland compositor (Sway, Hyprland, etc) ║"
+        );
+        eprintln!(
+            "╚══════════════════════════════════════════════════════════════╝\n"
+        );
+        std::process::exit(1);
+    }
+
+    // Step 1: Select region using slurp
+    println!("\n📍 Please select a screen region with your mouse...\n");
+
+    let region = match select_region_with_slurp() {
+        Ok(r) => {
+            info!(
+                "Selected region: {}x{} at ({}, {})",
+                r.width, r.height, r.x, r.y
+            );
+            r
+        }
+        Err(e) => {
+            error!("Region selection failed: {}", e);
+            eprintln!(
+                "\n╔══════════════════════════════════════════════════════════════╗"
+            );
+            eprintln!(
+                "║  ERROR: Region selection failed.                            ║"
+            );
+            eprintln!(
+                "║                                                              ║"
+            );
+            eprintln!(
+                "║  Please ensure 'slurp' is installed:                        ║"
+            );
+            eprintln!(
+                "║    sudo pacman -S slurp     # Arch Linux                    ║"
+            );
+            eprintln!(
+                "║    sudo apt install slurp   # Debian/Ubuntu                 ║"
+            );
+            eprintln!(
+                "║    sudo dnf install slurp   # Fedora                        ║"
+            );
+            eprintln!(
+                "╚══════════════════════════════════════════════════════════════╝\n"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "\n✅ Region selected: {}x{} at ({}, {})",
+        region.width, region.height, region.x, region.y
+    );
+    println!("📜 Start scrolling in your target window to capture!");
+    println!("💡 The preview window will update as you scroll.\n");
+
+    // Create communication channels
+    let channels = Channels::new();
+
+    // Shared shutdown flag
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Start Thread A: Input Monitor
+    let input_handle = {
+        let shutdown = shutdown.clone();
+        let tx = channels.input_tx.clone();
+        start_input_thread(tx, shutdown)
+    };
+
+    // Start Thread B: Worker
+    let worker_handle = {
+        let shutdown = shutdown.clone();
+        start_worker_thread(
+            region,
+            channels.input_rx,
+            channels.gui_rx,
+            channels.worker_tx,
+            shutdown,
+        )
+    };
+
+    // Run Thread C: Layer-shell overlay (on main thread)
+    // This blocks until the window is closed
+    let overlay_result = run_overlay(channels.worker_rx, channels.gui_tx, region);
+
+    // Signal shutdown
+    info!("Overlay closed, initiating shutdown...");
+    shutdown.store(true, Ordering::SeqCst);
+
+    // Wait for threads to finish
+    if let Err(e) = input_handle.join() {
+        warn!("Input thread panicked: {:?}", e);
+    }
+    if let Err(e) = worker_handle.join() {
+        warn!("Worker thread panicked: {:?}", e);
+    }
+
+    info!("Shutdown complete");
+
+    if let Err(e) = overlay_result {
+        error!("Overlay error: {}", e);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
