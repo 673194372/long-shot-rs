@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use arboard::Clipboard;
 use chrono::Local;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use fontdue::{Font, FontSettings};
 use log::{error, info};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -99,6 +100,20 @@ struct OverlayState {
     // 按钮位置
     save_button: ButtonRect,
     copy_button: ButtonRect,
+    cancel_button: ButtonRect,
+    
+    // 选区信息
+    capture_region: CaptureRegion,
+    
+    // 保存路径配置
+    output_path: Option<std::path::PathBuf>,
+    save_dir: Option<std::path::PathBuf>,
+    
+    // 保存后执行的命令
+    exec_command: Option<String>,
+    
+    // 最后保存的文件路径（用于执行命令）
+    last_saved_path: Option<std::path::PathBuf>,
 }
 
 impl OverlayState {
@@ -110,6 +125,10 @@ impl OverlayState {
         shm_state: Shm,
         worker_rx: Receiver<WorkerEvent>,
         gui_tx: Sender<GuiCommand>,
+        capture_region: CaptureRegion,
+        output_path: Option<std::path::PathBuf>,
+        save_dir: Option<std::path::PathBuf>,
+        exec_command: Option<String>,
     ) -> Self {
         Self {
             registry_state,
@@ -138,8 +157,15 @@ impl OverlayState {
             total_height: 0,
             status: "等待滚动...".to_string(),
             running: true,
-            save_button: ButtonRect { x: 10, y: 10, width: 44, height: 44 },
-            copy_button: ButtonRect { x: 64, y: 10, width: 44, height: 44 },
+            // 按钮放在底部，稍后在 draw 中根据实际高度调整
+            save_button: ButtonRect { x: 5, y: 0, width: 44, height: 44 },
+            copy_button: ButtonRect { x: 54, y: 0, width: 44, height: 44 },
+            cancel_button: ButtonRect { x: 103, y: 0, width: 44, height: 44 },
+            capture_region,
+            output_path,
+            save_dir,
+            exec_command,
+            last_saved_path: None,
         }
     }
 
@@ -185,7 +211,8 @@ impl OverlayState {
         let height = self.height;
         let save_button = self.save_button;
         let copy_button = self.copy_button;
-        let _status = self.status.clone();
+        let capture_region = self.capture_region;
+        let total_height = self.total_height;
         let image_data = self.image_data.clone();
         let image_width = self.image_width;
         let image_height = self.image_height;
@@ -215,18 +242,60 @@ impl OverlayState {
             pixel[3] = 0;  // A (完全透明)
         }
 
-        // 绘制按钮 (圆角矩形 + 图标)
-        Self::draw_rounded_button(canvas, width, save_button, [45, 45, 45, 220], [80, 200, 120, 255]); // 绿色保存
-        Self::draw_rounded_button(canvas, width, copy_button, [45, 45, 45, 220], [100, 180, 255, 255]); // 蓝色复制
+        // 布局：预览图占上部，按钮在底部，整体高度与选框一致
+        let button_size = 44i32;
+        let button_margin = 5i32;
+        let preview_y = 5i32;
+        let preview_height = (height as i32 - button_size - button_margin * 3 - preview_y).max(50);
         
-        // 绘制图标
-        Self::draw_save_icon(canvas, width, save_button, [255, 255, 255, 255]);
-        Self::draw_copy_icon(canvas, width, copy_button, [255, 255, 255, 255]);
+        // 按钮位置（底部居中）- 三个按钮：保存、复制、取消
+        let button_y = height as i32 - button_size - button_margin;
+        let btn_gap = 8;
+        let total_btn_width = button_size * 3 + btn_gap * 2; // 三个按钮 + 间距
+        let btn_start_x = (width as i32 - total_btn_width) / 2;
+        let save_btn = ButtonRect { x: btn_start_x, y: button_y, width: button_size, height: button_size };
+        let copy_btn = ButtonRect { x: btn_start_x + button_size + btn_gap, y: button_y, width: button_size, height: button_size };
+        let cancel_btn = ButtonRect { x: btn_start_x + (button_size + btn_gap) * 2, y: button_y, width: button_size, height: button_size };
 
-        // 绘制预览图像（显示底部，支持滚动）
+        // 绘制预览图像
         if let Some(ref img_data) = image_data {
-            Self::draw_preview_with_scroll(canvas, width, height, img_data, image_width, image_height, scroll_offset);
+            Self::draw_preview_with_scroll_new(canvas, width, height, preview_y, preview_height as u32, img_data, image_width, image_height, scroll_offset);
         }
+        
+        // 绘制尺寸信息: 宽x选框高(拼接总高度)
+        let stitched_height = self.image_height;
+        let info_text = format!("{}x{}({})", capture_region.width, capture_region.height, stitched_height);
+        
+        // 先绘制半透明背景矩形，确保文本可见
+        let text_bg_x = 5;
+        let text_bg_y = preview_y + 3;
+        let text_bg_w = 180.min(width as i32 - 10);
+        let text_bg_h = 20;
+        for ty in text_bg_y..(text_bg_y + text_bg_h) {
+            for tx in text_bg_x..(text_bg_x + text_bg_w) {
+                if tx >= 0 && ty >= 0 && tx < width as i32 && ty < height as i32 {
+                    let idx = ((ty * stride) + (tx * 4)) as usize;
+                    if idx + 3 < canvas.len() {
+                        canvas[idx] = 0;      // B
+                        canvas[idx + 1] = 0;  // G
+                        canvas[idx + 2] = 0;  // R
+                        canvas[idx + 3] = 180; // A (半透明黑色背景)
+                    }
+                }
+            }
+        }
+        
+        Self::draw_info_text(canvas, width, height, 10, preview_y + 8, &info_text, [255, 255, 255, 255]);
+
+        // 绘制图标按钮（底部，无边框）
+        Self::draw_icon_button(canvas, width, save_btn, [45, 45, 45, 200], true);   // 保存图标
+        Self::draw_icon_button(canvas, width, copy_btn, [45, 45, 45, 200], false);  // 复制图标
+        Self::draw_cancel_button(canvas, width, cancel_btn, [80, 45, 45, 200]);     // 取消图标（红色调）
+        
+        // 更新按钮位置
+        self.save_button = save_btn;
+        self.copy_button = copy_btn;
+        self.cancel_button = cancel_btn;
 
         // 提交并请求下一帧
         if let Some(ref layer_surface) = self.layer_surface {
@@ -239,76 +308,188 @@ impl OverlayState {
         }
     }
 
-    /// 绘制保存图标 (磁盘图标)
+    /// 绘制保存图标 (磁盘图标，2px线宽，更清晰)
     fn draw_save_icon(canvas: &mut [u8], width: u32, btn: ButtonRect, color: [u8; 4]) {
         let stride = width as i32 * 4;
         let cx = btn.x + btn.width / 2;
         let cy = btn.y + btn.height / 2;
+        let t = 2i32; // 线条粗细
         
-        // 磁盘外框 (16x14)
-        for dy in -7..7 {
-            for dx in -8..8 {
-                let px = cx + dx;
-                let py = cy + dy;
-                let is_border = dx == -8 || dx == 7 || dy == -7 || dy == 6;
-                let is_top_notch = dy == -7 && dx > -6 && dx < 5; // 顶部缺口
-                let is_label = dy >= 2 && dy <= 5 && dx >= -5 && dx <= 4; // 标签区域
+        // 磁盘外框 (18x16)，使用填充矩形绘制粗线条
+        let left = cx - 9;
+        let right = cx + 9;
+        let top = cy - 8;
+        let bottom = cy + 8;
+        
+        for py in top..bottom {
+            for px in left..right {
+                // 外框（2px粗）
+                let is_left = px >= left && px < left + t;
+                let is_right = px > right - t && px < right;
+                let is_top = py >= top && py < top + t && (px < cx - 4 || px >= cx + 5);
+                let is_bottom = py > bottom - t && py < bottom;
                 
-                if (is_border && !is_top_notch) || is_label {
+                // 底部标签区域（实心）
+                let is_label = py >= cy + 2 && py < bottom - t && px > left + t && px < right - t;
+                
+                if is_left || is_right || is_top || is_bottom || is_label {
                     let idx = ((py * stride) + (px * 4)) as usize;
-                    if idx + 3 < canvas.len() {
-                        canvas[idx] = color[0];
-                        canvas[idx + 1] = color[1];
-                        canvas[idx + 2] = color[2];
-                        canvas[idx + 3] = color[3];
+                    if idx + 3 < canvas.len() && px >= 0 && py >= 0 && px < width as i32 {
+                        canvas[idx..idx+4].copy_from_slice(&color);
                     }
                 }
             }
         }
     }
     
-    /// 绘制复制图标 (剪贴板图标)
+    /// 绘制复制图标 (两个重叠矩形，2px线宽，更清晰)
     fn draw_copy_icon(canvas: &mut [u8], width: u32, btn: ButtonRect, color: [u8; 4]) {
         let stride = width as i32 * 4;
         let cx = btn.x + btn.width / 2;
         let cy = btn.y + btn.height / 2;
+        let t = 2i32; // 线条粗细
         
-        // 两个重叠的矩形
-        // 后面的矩形
-        for dy in -6..4 {
-            for dx in -4..6 {
-                let px = cx + dx;
-                let py = cy + dy;
-                let is_back = (dx == -4 || dx == 5) && dy >= -6 && dy < 1;
-                let is_back_top = dy == -6 && dx >= -4 && dx <= 5;
-                let is_back_bottom = dy == 0 && dx >= 2 && dx <= 5;
+        // 后面的矩形（右上）
+        let b_left = cx - 2;
+        let b_right = cx + 8;
+        let b_top = cy - 8;
+        let b_bottom = cy + 2;
+        
+        for py in b_top..b_bottom {
+            for px in b_left..b_right {
+                let is_left = px >= b_left && px < b_left + t && py < cy - 2;
+                let is_right = px > b_right - t && px < b_right;
+                let is_top = py >= b_top && py < b_top + t;
+                let is_bottom = py > b_bottom - t && py < b_bottom && px > cx + 2;
                 
-                if is_back || is_back_top || is_back_bottom {
+                if is_left || is_right || is_top || is_bottom {
                     let idx = ((py * stride) + (px * 4)) as usize;
-                    if idx + 3 < canvas.len() {
-                        canvas[idx] = color[0];
-                        canvas[idx + 1] = color[1];
-                        canvas[idx + 2] = color[2];
-                        canvas[idx + 3] = color[3];
+                    if idx + 3 < canvas.len() && px >= 0 && py >= 0 && px < width as i32 {
+                        canvas[idx..idx+4].copy_from_slice(&color);
                     }
                 }
             }
         }
         
-        // 前面的矩形
-        for dy in -3..7 {
-            for dx in -7..3 {
-                let px = cx + dx;
-                let py = cy + dy;
-                let is_front = dx == -7 || dx == 2 || dy == -3 || dy == 6;
+        // 前面的矩形（左下）
+        let f_left = cx - 8;
+        let f_right = cx + 2;
+        let f_top = cy - 2;
+        let f_bottom = cy + 8;
+        
+        for py in f_top..f_bottom {
+            for px in f_left..f_right {
+                let is_left = px >= f_left && px < f_left + t;
+                let is_right = px > f_right - t && px < f_right;
+                let is_top = py >= f_top && py < f_top + t;
+                let is_bottom = py > f_bottom - t && py < f_bottom;
                 
-                if is_front {
+                if is_left || is_right || is_top || is_bottom {
+                    let idx = ((py * stride) + (px * 4)) as usize;
+                    if idx + 3 < canvas.len() && px >= 0 && py >= 0 && px < width as i32 {
+                        canvas[idx..idx+4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 绘制取消按钮 (X 图标，抗锯齿)
+    fn draw_cancel_button(canvas: &mut [u8], canvas_width: u32, btn: ButtonRect, bg_color: [u8; 4]) {
+        let stride = canvas_width as i32 * 4;
+        let r = 6.0f32; // 圆角半径
+        
+        // 绘制圆角矩形背景（使用浮点计算实现平滑边缘）
+        for dy in 0..btn.height {
+            for dx in 0..btn.width {
+                let px = btn.x + dx;
+                let py = btn.y + dy;
+                
+                if px < 0 || py < 0 || px >= canvas_width as i32 {
+                    continue;
+                }
+                
+                // 计算到最近圆角中心的距离
+                let fx = dx as f32 + 0.5;
+                let fy = dy as f32 + 0.5;
+                let w = btn.width as f32;
+                let h = btn.height as f32;
+                
+                // 确定是否在圆角区域
+                let in_corner_region = (fx < r && fy < r) || 
+                                       (fx > w - r && fy < r) ||
+                                       (fx < r && fy > h - r) ||
+                                       (fx > w - r && fy > h - r);
+                
+                let alpha = if in_corner_region {
+                    // 计算到圆角中心的距离
+                    let (cx, cy) = if fx < r && fy < r {
+                        (r, r)
+                    } else if fx > w - r && fy < r {
+                        (w - r, r)
+                    } else if fx < r && fy > h - r {
+                        (r, h - r)
+                    } else {
+                        (w - r, h - r)
+                    };
+                    
+                    let dist = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+                    if dist <= r - 0.5 {
+                        1.0
+                    } else if dist >= r + 0.5 {
+                        0.0
+                    } else {
+                        // 抗锯齿：平滑过渡
+                        r + 0.5 - dist
+                    }
+                } else {
+                    1.0
+                };
+                
+                if alpha > 0.0 {
                     let idx = ((py * stride) + (px * 4)) as usize;
                     if idx + 3 < canvas.len() {
-                        canvas[idx] = color[0];
-                        canvas[idx + 1] = color[1];
-                        canvas[idx + 2] = color[2];
-                        canvas[idx + 3] = color[3];
+                        if alpha >= 1.0 {
+                            canvas[idx..idx+4].copy_from_slice(&bg_color);
+                        } else {
+                            // Alpha 混合
+                            let a = (alpha * bg_color[3] as f32) as u8;
+                            canvas[idx] = bg_color[0];
+                            canvas[idx + 1] = bg_color[1];
+                            canvas[idx + 2] = bg_color[2];
+                            canvas[idx + 3] = a;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 绘制 X 图标 (两条对角线，2px粗)
+        let color: [u8; 4] = [255, 100, 100, 255]; // 红色调
+        let cx = btn.x + btn.width / 2;
+        let cy = btn.y + btn.height / 2;
+        let size = 8i32;
+        
+        // 绘制粗线条的 X
+        for i in -size..=size {
+            for t in -1..=1 {
+                // 左上到右下的对角线
+                let px1 = cx + i;
+                let py1 = cy + i + t;
+                if px1 >= 0 && py1 >= 0 && px1 < canvas_width as i32 {
+                    let idx = ((py1 * stride) + (px1 * 4)) as usize;
+                    if idx + 3 < canvas.len() {
+                        canvas[idx..idx+4].copy_from_slice(&color);
+                    }
+                }
+                
+                // 右上到左下的对角线
+                let px2 = cx + i;
+                let py2 = cy - i + t;
+                if px2 >= 0 && py2 >= 0 && px2 < canvas_width as i32 {
+                    let idx = ((py2 * stride) + (px2 * 4)) as usize;
+                    if idx + 3 < canvas.len() {
+                        canvas[idx..idx+4].copy_from_slice(&color);
                     }
                 }
             }
@@ -334,9 +515,407 @@ impl OverlayState {
             }
         }
     }
+    
+    /// 加载系统字体
+    fn load_font() -> Option<Font> {
+        let font_paths = [
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        ];
+        
+        for path in &font_paths {
+            if let Ok(data) = std::fs::read(path) {
+                if let Ok(font) = Font::from_bytes(data, FontSettings::default()) {
+                    return Some(font);
+                }
+            }
+        }
+        None
+    }
+    
+    /// 绘制信息文本
+    fn draw_info_text(canvas: &mut [u8], width: u32, height: u32, x: i32, y: i32, text: &str, color: [u8; 4]) {
+        let stride = width as i32 * 4;
+        
+        if let Some(font) = Self::load_font() {
+            // 使用字体渲染
+            let font_size = 12.0f32;
+            let mut cursor_x = x;
+            
+            for ch in text.chars() {
+                let (metrics, bitmap) = font.rasterize(ch, font_size);
+                let char_x = cursor_x + metrics.xmin;
+                let char_y = y + (font_size as i32 - metrics.height as i32 - metrics.ymin);
+                
+                for row in 0..metrics.height {
+                    for col in 0..metrics.width {
+                        let alpha = bitmap[row * metrics.width + col];
+                        if alpha > 0 {
+                            let px = char_x + col as i32;
+                            let py = char_y + row as i32;
+                            
+                            if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
+                                let idx = ((py * stride) + (px * 4)) as usize;
+                                if idx + 3 < canvas.len() {
+                                    let a = alpha as u32;
+                                    let inv_a = 255 - a;
+                                    canvas[idx] = ((color[0] as u32 * a + canvas[idx] as u32 * inv_a) / 255) as u8;
+                                    canvas[idx + 1] = ((color[1] as u32 * a + canvas[idx + 1] as u32 * inv_a) / 255) as u8;
+                                    canvas[idx + 2] = ((color[2] as u32 * a + canvas[idx + 2] as u32 * inv_a) / 255) as u8;
+                                    canvas[idx + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+                cursor_x += metrics.advance_width as i32;
+            }
+        } else {
+            // Fallback: 简单像素字符
+            let mut char_x = x;
+            for ch in text.chars() {
+                Self::draw_char_fallback(canvas, stride, width, height, char_x, y, ch, color);
+                char_x += 8;
+            }
+        }
+    }
+    
+    /// Fallback 字符绘制
+    fn draw_char_fallback(canvas: &mut [u8], stride: i32, width: u32, height: u32, x: i32, y: i32, ch: char, color: [u8; 4]) {
+        let patterns: u8 = match ch {
+            '0' => 0b1111110, '1' => 0b0110000, '2' => 0b1101101,
+            '3' => 0b1111001, '4' => 0b0110011, '5' => 0b1011011,
+            '6' => 0b1011111, '7' => 0b1110000, '8' => 0b1111111,
+            '9' => 0b1111011, _ => 0,
+        };
+        
+        for dy in 0..10i32 {
+            for dx in 0..6i32 {
+                let px = x + dx;
+                let py = y + dy;
+                if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
+                    let should_draw = match ch {
+                        'x' => (dx == 1 && dy == 3) || (dx == 4 && dy == 3) ||
+                               (dx == 2 && dy == 4) || (dx == 3 && dy == 4) ||
+                               (dx == 2 && dy == 5) || (dx == 3 && dy == 5) ||
+                               (dx == 1 && dy == 6) || (dx == 4 && dy == 6),
+                        '0'..='9' => {
+                            let p = patterns;
+                            match (dx, dy) {
+                                (1..=4, 0) if p & 0b1000000 != 0 => true,
+                                (0, 1..=4) if p & 0b0100000 != 0 => true,
+                                (5, 1..=4) if p & 0b0010000 != 0 => true,
+                                (1..=4, 4) if p & 0b0001000 != 0 => true,
+                                (0, 5..=8) if p & 0b0000100 != 0 => true,
+                                (5, 5..=8) if p & 0b0000010 != 0 => true,
+                                (1..=4, 9) if p & 0b0000001 != 0 => true,
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    
+                    if should_draw {
+                        let idx = ((py * stride) + (px * 4)) as usize;
+                        if idx + 3 < canvas.len() {
+                            canvas[idx..idx+4].copy_from_slice(&color);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    /// 绘制预览图像
-    /// scroll_offset: 从底部开始的偏移量（正值向上滚动查看历史）
+    /// 绘制图标按钮（无边框，圆角背景 + 图标，抗锯齿）
+    fn draw_icon_button(canvas: &mut [u8], canvas_width: u32, btn: ButtonRect, bg_color: [u8; 4], is_save: bool) {
+        let stride = canvas_width as i32 * 4;
+        let r = 6.0f32; // 圆角半径
+        
+        // 绘制圆角矩形背景（使用浮点计算实现平滑边缘）
+        for dy in 0..btn.height {
+            for dx in 0..btn.width {
+                let px = btn.x + dx;
+                let py = btn.y + dy;
+                
+                if px < 0 || py < 0 || px >= canvas_width as i32 {
+                    continue;
+                }
+                
+                // 计算到最近圆角中心的距离
+                let fx = dx as f32 + 0.5;
+                let fy = dy as f32 + 0.5;
+                let w = btn.width as f32;
+                let h = btn.height as f32;
+                
+                // 确定是否在圆角区域
+                let in_corner_region = (fx < r && fy < r) || 
+                                       (fx > w - r && fy < r) ||
+                                       (fx < r && fy > h - r) ||
+                                       (fx > w - r && fy > h - r);
+                
+                let alpha = if in_corner_region {
+                    // 计算到圆角中心的距离
+                    let (cx, cy) = if fx < r && fy < r {
+                        (r, r)
+                    } else if fx > w - r && fy < r {
+                        (w - r, r)
+                    } else if fx < r && fy > h - r {
+                        (r, h - r)
+                    } else {
+                        (w - r, h - r)
+                    };
+                    
+                    let dist = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+                    if dist <= r - 0.5 {
+                        1.0
+                    } else if dist >= r + 0.5 {
+                        0.0
+                    } else {
+                        // 抗锯齿：平滑过渡
+                        r + 0.5 - dist
+                    }
+                } else {
+                    1.0
+                };
+                
+                if alpha > 0.0 {
+                    let idx = ((py * stride) + (px * 4)) as usize;
+                    if idx + 3 < canvas.len() {
+                        if alpha >= 1.0 {
+                            canvas[idx..idx+4].copy_from_slice(&bg_color);
+                        } else {
+                            // Alpha 混合
+                            let a = (alpha * bg_color[3] as f32) as u8;
+                            canvas[idx] = bg_color[0];
+                            canvas[idx + 1] = bg_color[1];
+                            canvas[idx + 2] = bg_color[2];
+                            canvas[idx + 3] = a;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 绘制图标
+        let icon_color: [u8; 4] = [255, 255, 255, 255];
+        if is_save {
+            Self::draw_save_icon(canvas, canvas_width, btn, icon_color);
+        } else {
+            Self::draw_copy_icon(canvas, canvas_width, btn, icon_color);
+        }
+    }
+    
+    /// 绘制带文字的按钮（保留备用）
+    #[allow(dead_code)]
+    fn draw_button_with_text(
+        canvas: &mut [u8], 
+        canvas_width: u32, 
+        canvas_height: u32,
+        btn: ButtonRect, 
+        text: &str,
+        bg_color: [u8; 4], 
+        border_color: [u8; 4],
+    ) {
+        let stride = canvas_width as i32 * 4;
+        let radius = 6i32;
+        
+        // 绘制圆角矩形背景
+        for dy in 0..btn.height {
+            for dx in 0..btn.width {
+                let px = btn.x + dx;
+                let py = btn.y + dy;
+                
+                if px < 0 || py < 0 || px >= canvas_width as i32 || py >= canvas_height as i32 {
+                    continue;
+                }
+                
+                // 圆角检测
+                let in_corner = |cx: i32, cy: i32| -> bool {
+                    let ddx = (px - cx).abs();
+                    let ddy = (py - cy).abs();
+                    ddx * ddx + ddy * ddy > radius * radius
+                };
+                
+                let skip = (dx < radius && dy < radius && in_corner(btn.x + radius, btn.y + radius)) ||
+                           (dx >= btn.width - radius && dy < radius && in_corner(btn.x + btn.width - radius - 1, btn.y + radius)) ||
+                           (dx < radius && dy >= btn.height - radius && in_corner(btn.x + radius, btn.y + btn.height - radius - 1)) ||
+                           (dx >= btn.width - radius && dy >= btn.height - radius && in_corner(btn.x + btn.width - radius - 1, btn.y + btn.height - radius - 1));
+                
+                if !skip {
+                    let idx = ((py * stride) + (px * 4)) as usize;
+                    if idx + 3 < canvas.len() {
+                        // 边框或背景
+                        let is_border = dx < 2 || dx >= btn.width - 2 || dy < 2 || dy >= btn.height - 2;
+                        let color = if is_border { border_color } else { bg_color };
+                        canvas[idx..idx+4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+        
+        // 绘制文字（居中）
+        if let Some(font) = Self::load_font() {
+            let font_size = 14.0f32;
+            // 计算文字宽度
+            let mut text_width = 0i32;
+            for ch in text.chars() {
+                let (metrics, _) = font.rasterize(ch, font_size);
+                text_width += metrics.advance_width as i32;
+            }
+            
+            let text_x = btn.x + (btn.width - text_width) / 2;
+            let text_y = btn.y + (btn.height - font_size as i32) / 2 + 2;
+            
+            let mut cursor_x = text_x;
+            for ch in text.chars() {
+                let (metrics, bitmap) = font.rasterize(ch, font_size);
+                let char_x = cursor_x + metrics.xmin;
+                let char_y = text_y + (font_size as i32 - metrics.height as i32 - metrics.ymin);
+                
+                for row in 0..metrics.height {
+                    for col in 0..metrics.width {
+                        let alpha = bitmap[row * metrics.width + col];
+                        if alpha > 0 {
+                            let px = char_x + col as i32;
+                            let py = char_y + row as i32;
+                            
+                            if px >= 0 && py >= 0 && px < canvas_width as i32 && py < canvas_height as i32 {
+                                let idx = ((py * stride) + (px * 4)) as usize;
+                                if idx + 3 < canvas.len() {
+                                    let a = alpha as u32;
+                                    let inv_a = 255 - a;
+                                    canvas[idx] = ((255u32 * a + canvas[idx] as u32 * inv_a) / 255) as u8;
+                                    canvas[idx + 1] = ((255u32 * a + canvas[idx + 1] as u32 * inv_a) / 255) as u8;
+                                    canvas[idx + 2] = ((255u32 * a + canvas[idx + 2] as u32 * inv_a) / 255) as u8;
+                                    canvas[idx + 3] = 255;
+                                }
+                            }
+                        }
+                    }
+                }
+                cursor_x += metrics.advance_width as i32;
+            }
+        }
+    }
+
+    /// 绘制预览图像（新布局版本）
+    fn draw_preview_with_scroll_new(
+        canvas: &mut [u8], 
+        canvas_width: u32, 
+        _canvas_height: u32,
+        preview_y: i32,
+        preview_height: u32,
+        img_data: &[u8], 
+        img_width: u32, 
+        img_height: u32,
+        scroll_offset: i32,
+    ) {
+        let preview_width = (canvas_width - 10) as u32;
+
+        if img_width == 0 || img_height == 0 || preview_width == 0 || preview_height == 0 {
+            return;
+        }
+
+        // 固定宽度显示，计算缩放比例
+        let scale = preview_width as f32 / img_width as f32;
+        let scaled_img_height = (img_height as f32 * scale) as i32;
+        
+        let max_scroll = (scaled_img_height - preview_height as i32).max(0);
+        let clamped_offset = scroll_offset.clamp(0, max_scroll);
+        
+        let view_bottom = scaled_img_height - clamped_offset;
+        let view_top = (view_bottom - preview_height as i32).max(0);
+        
+        let offset_x = 5i32;
+        let stride = canvas_width as i32 * 4;
+        let src_stride = img_width as usize * 4;
+        let inv_scale = 1.0 / scale;
+
+        for dy in 0..preview_height {
+            let scaled_y = view_top + dy as i32;
+            if scaled_y < 0 || scaled_y >= scaled_img_height {
+                continue;
+            }
+            
+            for dx in 0..preview_width {
+                let src_x_start = (dx as f32 * inv_scale) as usize;
+                let src_y_start = (scaled_y as f32 * inv_scale) as usize;
+                let src_x_end = ((dx + 1) as f32 * inv_scale).ceil() as usize;
+                let src_y_end = ((scaled_y + 1) as f32 * inv_scale).ceil() as usize;
+                
+                let src_x_end = src_x_end.min(img_width as usize);
+                let src_y_end = src_y_end.min(img_height as usize);
+                
+                let mut r_sum = 0u32;
+                let mut g_sum = 0u32;
+                let mut b_sum = 0u32;
+                let mut count = 0u32;
+                
+                for sy in src_y_start..src_y_end {
+                    for sx in src_x_start..src_x_end {
+                        let src_idx = sy * src_stride + sx * 4;
+                        if src_idx + 3 < img_data.len() {
+                            r_sum += img_data[src_idx] as u32;
+                            g_sum += img_data[src_idx + 1] as u32;
+                            b_sum += img_data[src_idx + 2] as u32;
+                            count += 1;
+                        }
+                    }
+                }
+                
+                if count > 0 {
+                    let dst_x = offset_x + dx as i32;
+                    let dst_y = preview_y + dy as i32;
+                    
+                    if dst_x >= 0 && dst_y >= 0 && dst_x < canvas_width as i32 {
+                        let dst_idx = (dst_y * stride + dst_x * 4) as usize;
+                        if dst_idx + 3 < canvas.len() {
+                            canvas[dst_idx] = (b_sum / count) as u8;
+                            canvas[dst_idx + 1] = (g_sum / count) as u8;
+                            canvas[dst_idx + 2] = (r_sum / count) as u8;
+                            canvas[dst_idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 红色边框 (1px)
+        let border_color: [u8; 4] = [0, 0, 255, 255];
+        let bw = preview_width as i32;
+        let bh = preview_height as i32;
+        
+        // 上下边
+        for dx in 0..bw {
+            let px = offset_x + dx;
+            for &py in &[preview_y, preview_y + bh - 1] {
+                if px >= 0 && py >= 0 && px < canvas_width as i32 {
+                    let idx = ((py * stride) + (px * 4)) as usize;
+                    if idx + 3 < canvas.len() {
+                        canvas[idx..idx+4].copy_from_slice(&border_color);
+                    }
+                }
+            }
+        }
+        // 左右边
+        for dy in 0..bh {
+            let py = preview_y + dy;
+            for &px in &[offset_x, offset_x + bw - 1] {
+                if px >= 0 && py >= 0 && px < canvas_width as i32 {
+                    let idx = ((py * stride) + (px * 4)) as usize;
+                    if idx + 3 < canvas.len() {
+                        canvas[idx..idx+4].copy_from_slice(&border_color);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 绘制预览图像（旧版本，保留兼容）
+    #[allow(dead_code)]
     fn draw_preview_with_scroll(
         canvas: &mut [u8], 
         width: u32, 
@@ -346,7 +925,7 @@ impl OverlayState {
         img_height: u32,
         scroll_offset: i32,
     ) {
-        let preview_y = 60i32; // 按钮下方开始
+        let preview_y = 60i32;
         let preview_height = (height as i32 - preview_y - 5).max(0) as u32;
         let preview_width = (width - 10) as u32;
 
@@ -479,22 +1058,48 @@ impl OverlayState {
     }
 
     /// 保存图像
-    fn save_image(&self) {
+    fn save_image(&mut self) {
         if let Some(ref data) = self.image_data {
-            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-            let filename = format!("longshot_{}.png", timestamp);
-
-            let save_dir = dirs::picture_dir()
-                .or_else(|| dirs::home_dir())
-                .unwrap_or_else(|| PathBuf::from("."));
-
-            let path = save_dir.join(&filename);
+            // 确定保存路径
+            let path = if let Some(ref output) = self.output_path {
+                // 使用命令行指定的输出路径
+                output.clone()
+            } else {
+                // 生成默认文件名
+                let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+                let filename = format!("longshot_{}.png", timestamp);
+                
+                // 确定保存目录
+                let save_dir = if let Some(ref dir) = self.save_dir {
+                    dir.clone()
+                } else {
+                    dirs::picture_dir()
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_else(|| PathBuf::from("."))
+                };
+                
+                save_dir.join(&filename)
+            };
 
             match image::RgbaImage::from_raw(self.image_width, self.image_height, data.clone()) {
                 Some(img) => {
+                    // 确保父目录存在
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    
                     match img.save(&path) {
                         Ok(_) => {
                             info!("图像已保存: {}", path.display());
+                            println!("✅ 图像已保存: {}", path.display());
+                            
+                            // 保存路径用于后续执行命令
+                            self.last_saved_path = Some(path.clone());
+                            
+                            // 执行后续命令
+                            if let Some(ref cmd) = self.exec_command {
+                                self.execute_command(cmd, &path);
+                            }
                         }
                         Err(e) => {
                             error!("保存失败: {}", e);
@@ -504,6 +1109,28 @@ impl OverlayState {
                 None => {
                     error!("无法创建图像缓冲区");
                 }
+            }
+        }
+    }
+    
+    /// 执行后续命令
+    fn execute_command(&self, cmd_template: &str, file_path: &std::path::Path) {
+        let path_str = file_path.display().to_string();
+        let cmd = cmd_template.replace("{}", &path_str);
+        
+        info!("执行命令: {}", cmd);
+        
+        // 使用 sh -c 执行命令
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .spawn()
+        {
+            Ok(_) => {
+                info!("命令已启动");
+            }
+            Err(e) => {
+                error!("执行命令失败: {}", e);
             }
         }
     }
@@ -547,6 +1174,9 @@ impl OverlayState {
             info!("点击复制按钮");
             self.copy_to_clipboard();
             self.running = false; // 复制后退出
+        } else if self.cancel_button.contains(ix, iy) {
+            info!("点击取消按钮");
+            self.running = false; // 直接退出，不保存
         }
     }
     
@@ -760,7 +1390,8 @@ impl PointerHandler for OverlayState {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        let preview_y = 60i32;
+        // 新布局：预览在上，按钮在下
+        let button_area_y = self.save_button.y; // 按钮区域起始 Y
         
         for event in events {
             match event.kind {
@@ -771,17 +1402,15 @@ impl PointerHandler for OverlayState {
                     // 处理拖动滚动
                     if self.is_dragging {
                         let delta_y = (self.pointer_y - self.drag_start_y) as i32;
-                        // 向下拖动增加 offset（查看上面的内容）
                         self.scroll_offset = (self.drag_start_offset + delta_y).max(0);
                     }
                 }
                 PointerEventKind::Press { button, .. } => {
                     if button == 272 {
-                        // 左键
                         let y = self.pointer_y as i32;
                         
-                        // 检查是否在预览区域内（按钮下方）
-                        if y > preview_y {
+                        // 检查是否在预览区域内（按钮区域上方）
+                        if y < button_area_y {
                             // 在预览区域开始拖动
                             self.is_dragging = true;
                             self.drag_start_y = self.pointer_y;
@@ -794,13 +1423,12 @@ impl PointerHandler for OverlayState {
                 }
                 PointerEventKind::Release { button, .. } => {
                     if button == 272 {
-                        // 如果不是拖动，且释放在按钮区域，才处理点击
-                        if !self.is_dragging || 
-                           ((self.pointer_y - self.drag_start_y).abs() < 5.0) {
-                            let y = self.pointer_y as i32;
-                            if y <= preview_y {
-                                self.handle_click(self.pointer_x, self.pointer_y);
-                            }
+                        // 如果移动很小，当作点击处理
+                        if self.is_dragging && (self.pointer_y - self.drag_start_y).abs() < 5.0 {
+                            // 在预览区域的点击不做处理
+                        } else if !self.is_dragging {
+                            // 按钮区域点击
+                            self.handle_click(self.pointer_x, self.pointer_y);
                         }
                         self.is_dragging = false;
                     }
@@ -837,6 +1465,9 @@ pub fn run_overlay(
     worker_rx: Receiver<WorkerEvent>,
     gui_tx: Sender<GuiCommand>,
     region: CaptureRegion,
+    output_path: Option<std::path::PathBuf>,
+    save_dir: Option<std::path::PathBuf>,
+    exec_command: Option<String>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("无法连接到 Wayland")?;
 
@@ -859,6 +1490,10 @@ pub fn run_overlay(
         shm_state,
         worker_rx,
         gui_tx.clone(),
+        region,
+        output_path,
+        save_dir,
+        exec_command,
     );
 
     // 创建 layer surface
@@ -874,11 +1509,12 @@ pub fn run_overlay(
 
     // 计算窗口位置：选框右侧，保持 10px 间距
     let margin_left = region.x + region.width as i32 + 10;
+    let margin_top = region.y; // 与选框顶部对齐
     
-    // 设置窗口属性 - 固定宽度，使用屏幕高度（垂直锚定）
-    layer_surface.set_size(WINDOW_WIDTH, 0); // 高度 0 表示由锚定决定
-    layer_surface.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT); // 垂直全屏，左侧定位
-    layer_surface.set_margin(0, 0, 0, margin_left); // top, right, bottom, left
+    // 设置窗口属性 - 固定宽度，高度与选框一致
+    layer_surface.set_size(WINDOW_WIDTH, region.height);
+    layer_surface.set_anchor(Anchor::TOP | Anchor::LEFT);
+    layer_surface.set_margin(margin_top, 0, 0, margin_left);
     layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer_surface.commit();
 

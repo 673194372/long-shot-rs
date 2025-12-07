@@ -83,13 +83,13 @@ sudo dnf install rust cargo opencv-devel clang-devel cmake pkg-config
 
 ```bash
 # Arch Linux
-sudo pacman -S opencv slurp wl-clipboard
+sudo pacman -S opencv wl-clipboard
 
 # Debian/Ubuntu
-sudo apt install libopencv-core4.* libopencv-imgproc4.* slurp wl-clipboard
+sudo apt install libopencv-core4.* libopencv-imgproc4.* wl-clipboard
 
 # Fedora
-sudo dnf install opencv slurp wl-clipboard
+sudo dnf install opencv wl-clipboard
 ```
 
 ### Wayland Compositor Requirements
@@ -125,13 +125,47 @@ cargo build --release
 ## Usage
 
 ```bash
-./target/release/long-shot-rs
+./target/release/long-shot-rs [OPTIONS]
 ```
 
-1. **Select region**: Use slurp to select the scrollable area
+### Command Line Options
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output <PATH>` | Output file path (auto-generates timestamp-based name if not specified) |
+| `-d, --save-dir <DIR>` | Output directory for auto-named files (default: ~/Pictures) |
+| `-e, --exec <CMD>` | Command to execute after saving. Use `{}` as placeholder for file path |
+| `-h, --help` | Print help information |
+| `-V, --version` | Print version |
+
+### Examples
+
+```bash
+# Basic usage - saves to ~/Pictures/longshot_YYYYMMDD_HHMMSS.png
+./target/release/long-shot-rs
+
+# Save to specific file
+./target/release/long-shot-rs -o ~/screenshot.png
+
+# Save to custom directory
+./target/release/long-shot-rs -d ~/Screenshots/
+
+# Open image after saving
+./target/release/long-shot-rs -e "xdg-open {}"
+
+# Open with specific viewer
+./target/release/long-shot-rs -e "imv {}"
+
+# Copy path to clipboard after saving
+./target/release/long-shot-rs -e "echo {} | wl-copy"
+```
+
+### Workflow
+
+1. **Select region**: Drag to select the scrollable area
 2. **Scroll content**: Scroll slowly in the target window
 3. **Preview**: Watch real-time stitching in the overlay
-4. **Export**: Click Save (💾) or Copy (📋) button
+4. **Export**: Click Save (💾), Copy (📋), or Cancel (✕) button
 
 ### Tips
 
@@ -145,8 +179,9 @@ cargo build --release
 |---------|----------|
 | "No scroll devices found" | Add user to `input` group |
 | "Compositor does not support..." | Use wlroots-based compositor |
-| "slurp failed" | Install slurp package |
 | Poor stitching | Scroll slower, avoid blank areas |
+| Preview not showing | Check if compositor supports layer-shell |
+| Region selection not working | Check if compositor supports layer-shell |
 
 ## License
 

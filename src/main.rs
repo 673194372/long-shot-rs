@@ -17,7 +17,9 @@ mod types;
 mod worker;
 
 use anyhow::Result;
+use clap::Parser;
 use log::{error, info, warn};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -27,7 +29,30 @@ use selector::{select_region, start_border_thread};
 use types::Channels;
 use worker::start_worker_thread;
 
+/// Long Shot - Wayland Scrolling Screenshot Tool
+#[derive(Parser, Debug)]
+#[command(name = "long-shot-rs")]
+#[command(about = "High-performance scrolling screenshot tool for Wayland")]
+#[command(version)]
+struct Args {
+    /// Output file path (auto-generates if not specified)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    
+    /// Output directory for auto-named files
+    #[arg(short = 'd', long)]
+    save_dir: Option<PathBuf>,
+    
+    /// Command to execute after saving (use {} as placeholder for file path)
+    /// Example: --exec "imv {}" or --exec "xdg-open {}"
+    #[arg(short = 'e', long)]
+    exec: Option<String>,
+}
+
 fn main() -> Result<()> {
+    // Parse command line arguments
+    let args = Args::parse();
+    
     // Initialize logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
@@ -35,6 +60,13 @@ fn main() -> Result<()> {
 
     info!("Long Shot - Wayland Scrolling Screenshot");
     info!("=========================================");
+    
+    if let Some(ref output) = args.output {
+        info!("Output file: {:?}", output);
+    }
+    if let Some(ref save_dir) = args.save_dir {
+        info!("Save directory: {:?}", save_dir);
+    }
 
     // Check for Wayland session
     if std::env::var("WAYLAND_DISPLAY").is_err() {
@@ -117,7 +149,7 @@ fn main() -> Result<()> {
         )
     };
 
-    // Start border overlay thread (显示选区红框，不阻挡输入)
+    // Start border overlay thread (边框绘制在选区外面，不会被录进去)
     let border_handle = {
         let shutdown = shutdown.clone();
         start_border_thread(region, shutdown)
@@ -125,7 +157,14 @@ fn main() -> Result<()> {
 
     // Run Thread C: Layer-shell overlay (on main thread)
     // This blocks until the window is closed
-    let overlay_result = run_overlay(channels.worker_rx, channels.gui_tx, region);
+    let overlay_result = run_overlay(
+        channels.worker_rx, 
+        channels.gui_tx, 
+        region,
+        args.output,
+        args.save_dir,
+        args.exec,
+    );
 
     // Signal shutdown
     info!("Overlay closed, initiating shutdown...");

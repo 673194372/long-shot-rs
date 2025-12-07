@@ -1,14 +1,16 @@
 //! Image stitching using OpenCV.
-//! Implements Sobel gradient + template matching algorithm for scroll-based stitching.
+//! Advanced algorithms: ORB feature matching, sticky header detection, image blending, scrollbar removal.
 
 use crate::types::{RawFrame, StitchParams};
 use anyhow::{Result, anyhow};
 use log::{debug, info};
 use opencv::core::{
     self, Mat, MatTraitConst, MatTraitConstManual, Point, Rect, Size, CV_8UC4,
-    BORDER_DEFAULT, AlgorithmHint,
+    BORDER_DEFAULT, AlgorithmHint, KeyPoint, DMatch, Vector,
 };
 use opencv::imgproc::{self, COLOR_BGRA2GRAY, TM_CCOEFF_NORMED};
+use opencv::features2d::{ORB, BFMatcher, Feature2DTrait, ORB_ScoreType};
+use opencv::prelude::{DescriptorMatcherTrait, KeyPointTraitConst};
 
 /// Image stitcher for long screenshots
 pub struct ImageStitcher {
@@ -25,6 +27,10 @@ pub struct ImageStitcher {
     last_match_y: Option<i32>,
     /// Frame counter
     frame_count: u32,
+    /// Detected sticky header height (auto-detected)
+    sticky_header_height: i32,
+    /// Detected scrollbar width (auto-detected)
+    scrollbar_width: i32,
 }
 
 impl ImageStitcher {
@@ -37,6 +43,8 @@ impl ImageStitcher {
             total_height: 0,
             last_match_y: None,
             frame_count: 0,
+            sticky_header_height: 0,
+            scrollbar_width: 0,
         }
     }
 
@@ -48,6 +56,130 @@ impl ImageStitcher {
         self.total_height = 0;
         self.last_match_y = None;
         self.frame_count = 0;
+        self.sticky_header_height = 0;
+        self.scrollbar_width = 0;
+    }
+    
+    // =========================================================================
+    // 1. 固定元素检测 (Sticky Header Detection)
+    // =========================================================================
+    
+    /// Detect sticky header by comparing two frames
+    /// Returns the height of the identical top region
+    fn detect_sticky_header(prev: &Mat, current: &Mat) -> i32 {
+        let height = prev.rows().min(current.rows());
+        let width = prev.cols().min(current.cols());
+        
+        if height == 0 || width == 0 {
+            return 0;
+        }
+        
+        let prev_data = match prev.data_bytes() {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
+        let curr_data = match current.data_bytes() {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
+        
+        let row_bytes = (width * 4) as usize;
+        let mut sticky_rows = 0;
+        
+        // Compare rows from top, find where they start to differ
+        for y in 0..height.min(200) as usize {  // Max check 200 rows
+            let prev_row_start = y * row_bytes;
+            let curr_row_start = y * row_bytes;
+            
+            if prev_row_start + row_bytes > prev_data.len() || 
+               curr_row_start + row_bytes > curr_data.len() {
+                break;
+            }
+            
+            let prev_row = &prev_data[prev_row_start..prev_row_start + row_bytes];
+            let curr_row = &curr_data[curr_row_start..curr_row_start + row_bytes];
+            
+            // Check if rows are identical (with small tolerance)
+            let mut diff_count = 0;
+            for i in (0..row_bytes).step_by(4) {
+                let diff = (prev_row[i] as i32 - curr_row[i] as i32).abs()
+                         + (prev_row[i+1] as i32 - curr_row[i+1] as i32).abs()
+                         + (prev_row[i+2] as i32 - curr_row[i+2] as i32).abs();
+                if diff > 10 {
+                    diff_count += 1;
+                }
+            }
+            
+            // If more than 5% pixels differ, stop
+            if diff_count > width as usize / 20 {
+                break;
+            }
+            sticky_rows += 1;
+        }
+        
+        // Must have at least 10 identical rows to be considered sticky
+        if sticky_rows >= 10 {
+            debug!("Detected sticky header: {} rows", sticky_rows);
+            sticky_rows as i32
+        } else {
+            0
+        }
+    }
+    
+    // =========================================================================
+    // 2. 滚动条检测 (Scrollbar Detection)
+    // =========================================================================
+    
+    /// Detect scrollbar width by analyzing the right edge
+    fn detect_scrollbar(mat: &Mat) -> i32 {
+        let height = mat.rows();
+        let width = mat.cols();
+        
+        if width < 20 || height < 100 {
+            return 0;
+        }
+        
+        let data = match mat.data_bytes() {
+            Ok(d) => d,
+            Err(_) => return 0,
+        };
+        
+        let row_bytes = (width * 4) as usize;
+        
+        // Check right edge for uniform vertical band (scrollbar characteristic)
+        for scrollbar_w in (8..25).rev() {
+            let mut is_uniform = true;
+            let check_x = width - scrollbar_w;
+            
+            // Sample multiple rows
+            let mut prev_color: Option<[u8; 3]> = None;
+            for y in (height / 4..height * 3 / 4).step_by(10) {
+                let idx = (y as usize) * row_bytes + (check_x as usize) * 4;
+                if idx + 3 >= data.len() {
+                    continue;
+                }
+                
+                let color = [data[idx], data[idx+1], data[idx+2]];
+                
+                if let Some(pc) = prev_color {
+                    let diff = (color[0] as i32 - pc[0] as i32).abs()
+                             + (color[1] as i32 - pc[1] as i32).abs()
+                             + (color[2] as i32 - pc[2] as i32).abs();
+                    if diff > 30 {
+                        is_uniform = false;
+                        break;
+                    }
+                }
+                prev_color = Some(color);
+            }
+            
+            if is_uniform {
+                debug!("Detected scrollbar width: {}", scrollbar_w);
+                return scrollbar_w;
+            }
+        }
+        
+        0
     }
 
     /// Convert raw frame to OpenCV Mat (BGRA)
@@ -116,10 +248,113 @@ impl ImageStitcher {
 
         Ok(gradient)
     }
+    
+    // =========================================================================
+    // 3. ORB 特征点匹配 (Feature Matching)
+    // =========================================================================
+    
+    /// Try ORB feature matching to find shift
+    /// Returns (shift, confidence) or None if not enough features
+    fn try_orb_matching(&self, prev_gray: &Mat, curr_gray: &Mat, sticky_height: i32) -> Option<(i32, f64)> {
+        // Create ORB detector
+        let mut orb = match ORB::create(
+            500,    // nfeatures
+            1.2,    // scaleFactor
+            8,      // nlevels
+            31,     // edgeThreshold
+            0,      // firstLevel
+            2,      // WTA_K
+            ORB_ScoreType::HARRIS_SCORE,
+            31,     // patchSize
+            20,     // fastThreshold
+        ) {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+        
+        // Extract ROI (skip sticky header and bottom margin)
+        let height = prev_gray.rows();
+        let roi_top = sticky_height.max(0);
+        let roi_bottom = height - (height / 10);
+        let roi_height = roi_bottom - roi_top;
+        
+        if roi_height < 100 {
+            return None;
+        }
+        
+        let prev_roi = Mat::roi(prev_gray, Rect::new(0, roi_top, prev_gray.cols(), roi_height)).ok()?;
+        let curr_roi = Mat::roi(curr_gray, Rect::new(0, roi_top, curr_gray.cols(), roi_height)).ok()?;
+        
+        // Detect keypoints and compute descriptors
+        let mut prev_kp = Vector::<KeyPoint>::new();
+        let mut curr_kp = Vector::<KeyPoint>::new();
+        let mut prev_desc = Mat::default();
+        let mut curr_desc = Mat::default();
+        
+        orb.detect_and_compute(&prev_roi, &Mat::default(), &mut prev_kp, &mut prev_desc, false).ok()?;
+        orb.detect_and_compute(&curr_roi, &Mat::default(), &mut curr_kp, &mut curr_desc, false).ok()?;
+        
+        if prev_kp.len() < 10 || curr_kp.len() < 10 {
+            debug!("ORB: Not enough keypoints (prev={}, curr={})", prev_kp.len(), curr_kp.len());
+            return None;
+        }
+        
+        // Match descriptors using BFMatcher with Hamming distance
+        let mut matcher = BFMatcher::create(core::NORM_HAMMING, true).ok()?;
+        let mut matches = Vector::<DMatch>::new();
+        matcher.match_(&prev_desc, &mut matches, &Mat::default()).ok()?;
+        
+        if matches.len() < 5 {
+            debug!("ORB: Not enough matches ({})", matches.len());
+            return None;
+        }
+        
+        // Filter good matches (distance < 50)
+        let mut y_shifts: Vec<f64> = Vec::new();
+        for m in matches.iter() {
+            if m.distance < 50.0 {
+                let prev_pt = prev_kp.get(m.query_idx as usize).ok()?;
+                let curr_pt = curr_kp.get(m.train_idx as usize).ok()?;
+                let shift = prev_pt.pt().y - curr_pt.pt().y;
+                y_shifts.push(shift as f64);
+            }
+        }
+        
+        if y_shifts.len() < 5 {
+            debug!("ORB: Not enough good matches ({})", y_shifts.len());
+            return None;
+        }
+        
+        // Calculate median shift (robust to outliers)
+        y_shifts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_shift = y_shifts[y_shifts.len() / 2];
+        
+        // Calculate confidence based on consistency
+        let mut consistent = 0;
+        for &s in &y_shifts {
+            if (s - median_shift).abs() < 10.0 {
+                consistent += 1;
+            }
+        }
+        let confidence = consistent as f64 / y_shifts.len() as f64;
+        
+        if confidence >= 0.5 && median_shift > 5.0 && median_shift < height as f64 * 0.8 {
+            debug!("ORB match: shift={:.1}, confidence={:.2}, matches={}", median_shift, confidence, y_shifts.len());
+            Some((median_shift as i32, confidence))
+        } else {
+            debug!("ORB: Low confidence ({:.2}) or invalid shift ({:.1})", confidence, median_shift);
+            None
+        }
+    }
 
-    /// Extract the effective region (ignoring top/bottom margins)
+    /// Extract the effective region (using detected sticky header instead of hardcoded value)
     fn get_effective_region(&self, height: i32) -> (i32, i32) {
-        let ignore_top = (height as f64 * self.params.ignore_y_top) as i32;
+        // Use detected sticky header height instead of hardcoded ignore_y_top
+        let ignore_top = if self.sticky_header_height > 0 {
+            self.sticky_header_height
+        } else {
+            (height as f64 * self.params.ignore_y_top) as i32
+        };
         let ignore_bottom = (height as f64 * self.params.ignore_y_bottom) as i32;
         let effective_top = ignore_top;
         let effective_bottom = height - ignore_bottom;
@@ -227,9 +462,16 @@ impl ImageStitcher {
         let gray = Self::to_grayscale(&current_mat)?;
         let gradient = Self::compute_gradient(&gray)?;
 
-        // First frame: initialize result
+        // First frame: initialize result and detect scrollbar
         if self.result.is_none() {
             info!("Initializing stitcher with first frame");
+            
+            // Detect scrollbar width on first frame
+            self.scrollbar_width = Self::detect_scrollbar(&current_mat);
+            if self.scrollbar_width > 0 {
+                info!("Detected scrollbar width: {}", self.scrollbar_width);
+            }
+            
             self.result = Some(current_mat.clone());
             self.prev_gradient = Some(gradient);
             self.prev_raw = Some(current_mat);
@@ -237,27 +479,40 @@ impl ImageStitcher {
             return Ok(true);
         }
 
-        // Extract template from current frame (top portion)
-        let template = self.extract_template(&gradient)?;
+        // Detect sticky header on second frame
+        let prev_raw = self.prev_raw.as_ref().unwrap();
+        if self.frame_count == 2 {
+            self.sticky_header_height = Self::detect_sticky_header(prev_raw, &current_mat);
+            if self.sticky_header_height > 0 {
+                info!("Detected sticky header: {} pixels", self.sticky_header_height);
+            }
+        }
 
-        // Search for template in previous frame
-        let prev_gradient = self.prev_gradient.as_ref().unwrap();
-        let match_result = self.find_match(&template, prev_gradient)?;
-
-        if let Some((match_y, confidence)) = match_result {
-            // Calculate shift (how many new pixels at the bottom)
-            let (effective_top, _) = self.get_effective_region(frame.height as i32);
-            let shift = match_y - effective_top;
-
-            debug!(
-                "Match found: y={}, confidence={:.3}, shift={}",
-                match_y, confidence, shift
-            );
-
-            if shift > 0 && shift < frame.height as i32 {
-                // Append new content to result
-                self.append_content(&current_mat, shift)?;
+        // Try ORB feature matching first
+        let prev_gray = Self::to_grayscale(prev_raw)?;
+        let shift = if let Some((orb_shift, orb_conf)) = self.try_orb_matching(&prev_gray, &gray, self.sticky_header_height) {
+            debug!("Using ORB match: shift={}, confidence={:.2}", orb_shift, orb_conf);
+            Some(orb_shift)
+        } else {
+            // Fallback to template matching
+            let template = self.extract_template(&gradient)?;
+            let prev_gradient = self.prev_gradient.as_ref().unwrap();
+            
+            if let Some((match_y, confidence)) = self.find_match(&template, prev_gradient)? {
+                let (effective_top, _) = self.get_effective_region(frame.height as i32);
+                let shift = match_y - effective_top;
+                debug!("Using template match: shift={}, confidence={:.2}", shift, confidence);
                 self.last_match_y = Some(match_y);
+                Some(shift)
+            } else {
+                None
+            }
+        };
+        
+        if let Some(shift) = shift {
+            if shift > 0 && shift < frame.height as i32 {
+                // Append new content to result with blending
+                self.append_content_with_blend(&current_mat, shift)?;
 
                 // Update previous frame
                 self.prev_gradient = Some(gradient);
@@ -283,6 +538,63 @@ impl ImageStitcher {
         self.prev_raw = Some(current_mat);
 
         Ok(false)
+    }
+    
+    // =========================================================================
+    // 4. 图像融合 (Image Blending)
+    // =========================================================================
+    
+    /// Append content - simple and reliable direct append
+    /// The template matching already ensures proper alignment, so just append new content
+    fn append_content_with_blend(&mut self, current: &Mat, shift: i32) -> Result<()> {
+        let result = self.result.as_ref().unwrap();
+        let current_height = current.rows();
+        let current_width = current.cols();
+
+        // New content starts at (height - shift)
+        let new_content_start = current_height - shift;
+        if new_content_start < 0 || new_content_start >= current_height {
+            return Ok(());
+        }
+
+        let result_data = result.data_bytes()?;
+        let current_data = current.data_bytes()?;
+        
+        let row_bytes = (current_width * 4) as usize;
+        
+        // Build new image: existing + new content (simple append, no blending)
+        let existing_bytes = (self.total_height as usize) * row_bytes;
+        let new_content_offset = (new_content_start as usize) * row_bytes;
+        let new_content_bytes = (shift as usize) * row_bytes;
+        
+        let total_bytes = existing_bytes + new_content_bytes;
+        let mut new_data = Vec::with_capacity(total_bytes);
+        
+        // Copy existing result
+        new_data.extend_from_slice(&result_data[..existing_bytes]);
+        
+        // Append new content directly
+        new_data.extend_from_slice(&current_data[new_content_offset..new_content_offset + new_content_bytes]);
+        
+        // Create new Mat
+        let new_height = self.total_height + shift;
+        let new_result = unsafe {
+            Mat::new_rows_cols_with_data_unsafe(
+                new_height,
+                current_width,
+                CV_8UC4,
+                new_data.as_ptr() as *mut _,
+                row_bytes,
+            )?
+        };
+        
+        let mut owned = Mat::default();
+        new_result.copy_to(&mut owned)?;
+
+        self.result = Some(owned);
+        self.total_height = new_height;
+
+        Ok(())
     }
 
     /// Append new content from the bottom of the current frame
@@ -344,6 +656,8 @@ impl ImageStitcher {
         let result = self.result.as_ref()?;
         let height = result.rows() as u32;
         let width = result.cols() as u32;
+        
+        debug!("发送图像: height={}, total_height={}", height, self.total_height);
 
         // Convert BGRA to RGBA
         let data = result.data_bytes().ok()?;

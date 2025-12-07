@@ -21,9 +21,9 @@
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  线程 A         │     │  线程 B          │     │  线程 C         │
-│  输入监控       │────▶│  工作线程        │────▶│  覆盖层窗口     │
-│  (evdev)        │     │  (截图+拼接)     │     │  (Layer Shell)  │
+│  线程 A          │     │  线程 B           │    │  线程 C         │
+│  输入监控        │────▶ │  工作线程         │────▶│  覆盖层窗口     │
+│  (evdev)        │     │  (截图+拼接)      │     │  (Layer Shell)  │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
          │                       │                       │
          ▼                       ▼                       ▼
@@ -126,18 +126,17 @@ sudo dnf install rust cargo opencv-devel clang-devel cmake pkg-config
 
 ```bash
 # Arch Linux
-sudo pacman -S opencv slurp wl-clipboard
+sudo pacman -S opencv wl-clipboard
 
 # Debian/Ubuntu
-sudo apt install libopencv-core4.* libopencv-imgproc4.* slurp wl-clipboard
+sudo apt install libopencv-core4.* libopencv-imgproc4.* wl-clipboard
 
 # Fedora
-sudo dnf install opencv slurp wl-clipboard
+sudo dnf install opencv wl-clipboard
 ```
 
 **说明**：
 - `opencv`：运行时链接的共享库
-- `slurp`：屏幕区域选择工具
 - `wl-clipboard`：Wayland 剪贴板工具（arboard 后端）
 
 ### Wayland 混成器要求
@@ -183,15 +182,47 @@ cargo build --release
 ## 使用方法
 
 ```bash
+./target/release/long-shot-rs [选项]
+```
+
+### 命令行选项
+
+| 选项 | 说明 |
+|------|------|
+| `-o, --output <路径>` | 输出文件路径（不指定则自动生成带时间戳的文件名） |
+| `-d, --save-dir <目录>` | 自动命名文件的保存目录（默认：~/Pictures） |
+| `-e, --exec <命令>` | 保存后执行的命令，使用 `{}` 作为文件路径占位符 |
+| `-h, --help` | 显示帮助信息 |
+| `-V, --version` | 显示版本号 |
+
+### 使用示例
+
+```bash
+# 基本用法 - 保存到 ~/Pictures/longshot_年月日_时分秒.png
 ./target/release/long-shot-rs
+
+# 保存到指定文件
+./target/release/long-shot-rs -o ~/screenshot.png
+
+# 保存到自定义目录
+./target/release/long-shot-rs -d ~/Screenshots/
+
+# 保存后自动打开图片
+./target/release/long-shot-rs -e "xdg-open {}"
+
+# 使用指定图片查看器打开
+./target/release/long-shot-rs -e "imv {}"
+
+# 保存后将路径复制到剪贴板
+./target/release/long-shot-rs -e "echo {} | wl-copy"
 ```
 
 ### 操作步骤
 
-1. **选择区域**：使用 slurp 选择要截图的滚动区域
+1. **选择区域**：拖拽选择要截图的滚动区域
 2. **滚动内容**：在目标窗口中缓慢滚动
 3. **查看预览**：实时观察拼接效果
-4. **导出图片**：点击保存 (💾) 或复制 (📋) 按钮
+4. **导出图片**：点击保存 (💾)、复制 (📋) 或取消 (✕) 按钮
 
 ### 使用技巧
 
@@ -206,9 +237,9 @@ cargo build --release
 |------|----------|
 | "No scroll devices found" | 将用户添加到 `input` 组 |
 | "Compositor does not support..." | 使用 wlroots 混成器 |
-| "slurp failed" | 安装 slurp 包 |
 | 拼接效果差 | 滚动更慢，避免空白区域 |
 | 预览窗口不显示 | 检查混成器是否支持 layer-shell |
+| 选区无法选择 | 检查混成器是否支持 layer-shell |
 
 ## Rust 依赖库
 
@@ -232,4 +263,3 @@ MIT
 - [smithay-client-toolkit](https://github.com/Smithay/client-toolkit) - Wayland 客户端工具包
 - [wayland-rs](https://github.com/Smithay/wayland-rs) - Wayland 协议 Rust 绑定
 - [OpenCV](https://opencv.org/) - 图像处理库
-- [slurp](https://github.com/emersion/slurp) - 区域选择工具
