@@ -38,7 +38,7 @@ use wayland_client::{
 };
 
 /// 窗口宽度
-const WINDOW_WIDTH: u32 = 220;
+const WINDOW_WIDTH: u32 = 200;
 
 /// 按钮区域
 #[derive(Clone, Copy)]
@@ -79,6 +79,12 @@ struct OverlayState {
     image_data: Option<Vec<u8>>,
     image_width: u32,
     image_height: u32,
+
+    // 预览滚动
+    scroll_offset: i32,      // 滚动偏移（从底部开始，正值向上滚动）
+    is_dragging: bool,       // 是否正在拖动
+    drag_start_y: f64,       // 拖动起始 Y
+    drag_start_offset: i32,  // 拖动起始偏移
 
     // 通信通道
     worker_rx: Receiver<WorkerEvent>,
@@ -122,6 +128,10 @@ impl OverlayState {
             image_data: None,
             image_width: 0,
             image_height: 0,
+            scroll_offset: 0,
+            is_dragging: false,
+            drag_start_y: 0.0,
+            drag_start_offset: 0,
             worker_rx,
             gui_tx,
             frame_count: 0,
@@ -175,10 +185,11 @@ impl OverlayState {
         let height = self.height;
         let save_button = self.save_button;
         let copy_button = self.copy_button;
-        let status = self.status.clone();
+        let _status = self.status.clone();
         let image_data = self.image_data.clone();
         let image_width = self.image_width;
         let image_height = self.image_height;
+        let scroll_offset = self.scroll_offset;
 
         let pool = match self.pool.as_mut() {
             Some(p) => p,
@@ -212,9 +223,9 @@ impl OverlayState {
         Self::draw_save_icon(canvas, width, save_button, [255, 255, 255, 255]);
         Self::draw_copy_icon(canvas, width, copy_button, [255, 255, 255, 255]);
 
-        // 绘制预览图像
+        // 绘制预览图像（显示底部，支持滚动）
         if let Some(ref img_data) = image_data {
-            Self::draw_preview_static(canvas, width, height, img_data, image_width, image_height);
+            Self::draw_preview_with_scroll(canvas, width, height, img_data, image_width, image_height, scroll_offset);
         }
 
         // 提交并请求下一帧
@@ -324,41 +335,59 @@ impl OverlayState {
         }
     }
 
-    /// 绘制预览图像 (静态方法)
-    fn draw_preview_static(canvas: &mut [u8], width: u32, height: u32, img_data: &[u8], img_width: u32, img_height: u32) {
+    /// 绘制预览图像
+    /// scroll_offset: 从底部开始的偏移量（正值向上滚动查看历史）
+    fn draw_preview_with_scroll(
+        canvas: &mut [u8], 
+        width: u32, 
+        height: u32, 
+        img_data: &[u8], 
+        img_width: u32, 
+        img_height: u32,
+        scroll_offset: i32,
+    ) {
         let preview_y = 60i32; // 按钮下方开始
         let preview_height = (height as i32 - preview_y - 5).max(0) as u32;
         let preview_width = (width - 10) as u32;
 
-        if img_width == 0 || img_height == 0 {
+        if img_width == 0 || img_height == 0 || preview_width == 0 || preview_height == 0 {
             return;
         }
 
-        // 计算缩放比例，保持宽高比
-        let scale_x = preview_width as f32 / img_width as f32;
-        let scale_y = preview_height as f32 / img_height as f32;
-        let scale = scale_x.min(scale_y).min(1.0);
-
-        let scaled_width = (img_width as f32 * scale) as u32;
-        let scaled_height = (img_height as f32 * scale) as u32;
-
+        // 固定宽度显示，计算缩放比例
+        let scale = preview_width as f32 / img_width as f32;
+        let scaled_img_height = (img_height as f32 * scale) as i32;
+        
+        // 计算源图像的起始 Y（从底部开始，加上滚动偏移）
+        // scroll_offset = 0 时显示底部，scroll_offset > 0 时向上滚动
+        let max_scroll = (scaled_img_height - preview_height as i32).max(0);
+        let clamped_offset = scroll_offset.clamp(0, max_scroll);
+        
+        // 在缩放后的图像中，显示的区域
+        let view_bottom = scaled_img_height - clamped_offset;
+        let view_top = (view_bottom - preview_height as i32).max(0);
+        
         let offset_x = 5i32;
         let offset_y = preview_y;
 
         let stride = width as i32 * 4;
         let src_stride = img_width as usize * 4;
-
-        // Box filter 缩放（区域平均，缩小时最清晰）
         let inv_scale = 1.0 / scale;
-        let box_size = inv_scale.ceil() as usize;
-        
-        for dy in 0..scaled_height.min(preview_height) {
-            for dx in 0..scaled_width.min(preview_width) {
-                // 计算源图像对应区域
+
+        // 绘制预览区域
+        for dy in 0..preview_height {
+            // 缩放后图像中的 Y 坐标
+            let scaled_y = view_top + dy as i32;
+            if scaled_y < 0 || scaled_y >= scaled_img_height {
+                continue;
+            }
+            
+            for dx in 0..preview_width {
+                // 计算源图像对应区域（Box filter）
                 let src_x_start = (dx as f32 * inv_scale) as usize;
-                let src_y_start = (dy as f32 * inv_scale) as usize;
+                let src_y_start = (scaled_y as f32 * inv_scale) as usize;
                 let src_x_end = ((dx + 1) as f32 * inv_scale).ceil() as usize;
-                let src_y_end = ((dy + 1) as f32 * inv_scale).ceil() as usize;
+                let src_y_end = ((scaled_y + 1) as f32 * inv_scale).ceil() as usize;
                 
                 let src_x_end = src_x_end.min(img_width as usize);
                 let src_y_end = src_y_end.min(img_height as usize);
@@ -388,7 +417,6 @@ impl OverlayState {
                     if dst_x >= 0 && dst_y >= 0 && dst_x < width as i32 && dst_y < height as i32 {
                         let dst_idx = (dst_y * stride + dst_x * 4) as usize;
                         if dst_idx + 3 < canvas.len() {
-                            // RGBA -> BGRA，取平均
                             canvas[dst_idx] = (b_sum / count) as u8;     // B
                             canvas[dst_idx + 1] = (g_sum / count) as u8; // G
                             canvas[dst_idx + 2] = (r_sum / count) as u8; // R
@@ -401,60 +429,49 @@ impl OverlayState {
         
         // 绘制红色边框 (2px)
         let border_color: [u8; 4] = [0, 0, 255, 255]; // BGRA: 红色
+        let display_height = preview_height.min(scaled_img_height as u32);
         for border in 0..2i32 {
             // 上边
-            for dx in 0..scaled_width as i32 {
+            for dx in 0..preview_width as i32 {
                 let px = offset_x + dx;
                 let py = offset_y + border;
                 if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
                     let idx = ((py * stride) + (px * 4)) as usize;
                     if idx + 3 < canvas.len() {
-                        canvas[idx] = border_color[0];
-                        canvas[idx + 1] = border_color[1];
-                        canvas[idx + 2] = border_color[2];
-                        canvas[idx + 3] = border_color[3];
+                        canvas[idx..idx+4].copy_from_slice(&border_color);
                     }
                 }
             }
             // 下边
-            for dx in 0..scaled_width as i32 {
+            for dx in 0..preview_width as i32 {
                 let px = offset_x + dx;
-                let py = offset_y + scaled_height as i32 - 1 - border;
+                let py = offset_y + display_height as i32 - 1 - border;
                 if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
                     let idx = ((py * stride) + (px * 4)) as usize;
                     if idx + 3 < canvas.len() {
-                        canvas[idx] = border_color[0];
-                        canvas[idx + 1] = border_color[1];
-                        canvas[idx + 2] = border_color[2];
-                        canvas[idx + 3] = border_color[3];
+                        canvas[idx..idx+4].copy_from_slice(&border_color);
                     }
                 }
             }
             // 左边
-            for dy in 0..scaled_height as i32 {
+            for dy in 0..display_height as i32 {
                 let px = offset_x + border;
                 let py = offset_y + dy;
                 if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
                     let idx = ((py * stride) + (px * 4)) as usize;
                     if idx + 3 < canvas.len() {
-                        canvas[idx] = border_color[0];
-                        canvas[idx + 1] = border_color[1];
-                        canvas[idx + 2] = border_color[2];
-                        canvas[idx + 3] = border_color[3];
+                        canvas[idx..idx+4].copy_from_slice(&border_color);
                     }
                 }
             }
             // 右边
-            for dy in 0..scaled_height as i32 {
-                let px = offset_x + scaled_width as i32 - 1 - border;
+            for dy in 0..display_height as i32 {
+                let px = offset_x + preview_width as i32 - 1 - border;
                 let py = offset_y + dy;
                 if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
                     let idx = ((py * stride) + (px * 4)) as usize;
                     if idx + 3 < canvas.len() {
-                        canvas[idx] = border_color[0];
-                        canvas[idx + 1] = border_color[1];
-                        canvas[idx + 2] = border_color[2];
-                        canvas[idx + 3] = border_color[3];
+                        canvas[idx..idx+4].copy_from_slice(&border_color);
                     }
                 }
             }
@@ -743,19 +760,51 @@ impl PointerHandler for OverlayState {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        let preview_y = 60i32;
+        
         for event in events {
             match event.kind {
                 PointerEventKind::Motion { .. } => {
                     self.pointer_x = event.position.0;
                     self.pointer_y = event.position.1;
+                    
+                    // 处理拖动滚动
+                    if self.is_dragging {
+                        let delta_y = (self.pointer_y - self.drag_start_y) as i32;
+                        // 向下拖动增加 offset（查看上面的内容）
+                        self.scroll_offset = (self.drag_start_offset + delta_y).max(0);
+                    }
                 }
                 PointerEventKind::Press { button, .. } => {
                     if button == 272 {
                         // 左键
-                        self.handle_click(self.pointer_x, self.pointer_y);
+                        let y = self.pointer_y as i32;
+                        
+                        // 检查是否在预览区域内（按钮下方）
+                        if y > preview_y {
+                            // 在预览区域开始拖动
+                            self.is_dragging = true;
+                            self.drag_start_y = self.pointer_y;
+                            self.drag_start_offset = self.scroll_offset;
+                        } else {
+                            // 在按钮区域，处理点击
+                            self.handle_click(self.pointer_x, self.pointer_y);
+                        }
                     }
                 }
-                PointerEventKind::Release { .. } => {}
+                PointerEventKind::Release { button, .. } => {
+                    if button == 272 {
+                        // 如果不是拖动，且释放在按钮区域，才处理点击
+                        if !self.is_dragging || 
+                           ((self.pointer_y - self.drag_start_y).abs() < 5.0) {
+                            let y = self.pointer_y as i32;
+                            if y <= preview_y {
+                                self.handle_click(self.pointer_x, self.pointer_y);
+                            }
+                        }
+                        self.is_dragging = false;
+                    }
+                }
                 _ => {}
             }
         }

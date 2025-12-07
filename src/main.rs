@@ -21,9 +21,9 @@ use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use capture::select_region_with_slurp;
 use input::start_input_thread;
 use overlay::run_overlay;
+use selector::{select_region, start_border_thread};
 use types::Channels;
 use worker::start_worker_thread;
 
@@ -60,43 +60,27 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Step 1: Select region using slurp
-    println!("\n📍 Please select a screen region with your mouse...\n");
+    // Step 1: Select region using custom selector
+    println!("\n📍 Please drag to select a screen region...\n");
+    println!("   Left click and drag to select");
+    println!("   Right click to cancel\n");
 
-    let region = match select_region_with_slurp() {
-        Ok(r) => {
+    let region = match select_region() {
+        Ok(Some(r)) => {
             info!(
                 "Selected region: {}x{} at ({}, {})",
                 r.width, r.height, r.x, r.y
             );
             r
         }
+        Ok(None) => {
+            info!("Selection cancelled");
+            println!("\n❌ Selection cancelled.");
+            std::process::exit(0);
+        }
         Err(e) => {
             error!("Region selection failed: {}", e);
-            eprintln!(
-                "\n╔══════════════════════════════════════════════════════════════╗"
-            );
-            eprintln!(
-                "║  ERROR: Region selection failed.                            ║"
-            );
-            eprintln!(
-                "║                                                              ║"
-            );
-            eprintln!(
-                "║  Please ensure 'slurp' is installed:                        ║"
-            );
-            eprintln!(
-                "║    sudo pacman -S slurp     # Arch Linux                    ║"
-            );
-            eprintln!(
-                "║    sudo apt install slurp   # Debian/Ubuntu                 ║"
-            );
-            eprintln!(
-                "║    sudo dnf install slurp   # Fedora                        ║"
-            );
-            eprintln!(
-                "╚══════════════════════════════════════════════════════════════╝\n"
-            );
+            eprintln!("\n❌ Region selection failed: {}", e);
             std::process::exit(1);
         }
     };
@@ -133,6 +117,12 @@ fn main() -> Result<()> {
         )
     };
 
+    // Start border overlay thread (显示选区红框，不阻挡输入)
+    let border_handle = {
+        let shutdown = shutdown.clone();
+        start_border_thread(region, shutdown)
+    };
+
     // Run Thread C: Layer-shell overlay (on main thread)
     // This blocks until the window is closed
     let overlay_result = run_overlay(channels.worker_rx, channels.gui_tx, region);
@@ -147,6 +137,9 @@ fn main() -> Result<()> {
     }
     if let Err(e) = worker_handle.join() {
         warn!("Worker thread panicked: {:?}", e);
+    }
+    if let Err(e) = border_handle.join() {
+        warn!("Border thread panicked: {:?}", e);
     }
 
     info!("Shutdown complete");
