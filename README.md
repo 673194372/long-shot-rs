@@ -1,4 +1,14 @@
-# Long Shot RS
+# ⚠️ Project Moved / 项目已迁移
+
+> **This project has been refactored and moved to a new repository. Please visit:**
+>
+> **👉 [https://github.com/jswysnemc/wayscrollshot](https://github.com/jswysnemc/wayscrollshot)**
+>
+> **本项目已重构并迁移至新仓库，请访问上方链接。**
+
+---
+
+# Long Shot RS (Archived)
 
 [中文文档](README_CN.md)
 
@@ -6,6 +16,7 @@ High-performance native **long screenshot** (scrolling capture) application for 
 
 ![Demo](https://img.shields.io/badge/Platform-Linux%20Wayland-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
+![Status](https://img.shields.io/badge/Status-Archived-red)
 
 ## Features
 
@@ -190,11 +201,11 @@ MIT
 ## Rust Dependencies
 
 ```toml
-wayland-client = "0.31"          # Wayland protocol
-wayland-protocols-wlr = "0.3"    # wlr extensions
-smithay-client-toolkit = "0.19"  # Layer shell
-opencv = "0.93"                  # Image processing
-evdev = "0.12"                   # Input monitoring
-arboard = "3.4"                  # Clipboard
-crossbeam-channel = "0.5"        # Thread communication
+wayland-client = \"0.31\"          # Wayland protocol
+wayland-protocols-wlr = \"0.3\"    # wlr extensions
+smithay-client-toolkit = \"0.19\"  # Layer shell
+opencv = \"0.93\"                  # Image processing
+evdev = \"0.12\"                   # Input monitoring
+arboard = \"3.4\"                  # Clipboard
+crossbeam-channel = \"0.5\"        # Thread communication
 ```
